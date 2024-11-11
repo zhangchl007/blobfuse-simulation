@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: blobfuse-pvc
+spec:
+  storageClassName: azureblob-fuse2
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 100Gi

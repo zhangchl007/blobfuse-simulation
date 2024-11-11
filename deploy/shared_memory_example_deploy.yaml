@@ -1,0 +1,31 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shared-memory-example
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: shared-memory-example
+  template:
+    metadata:
+      labels:
+        app: shared-memory-example
+    spec:
+      containers:
+        - name: shared-memory-example
+          command: ["sleep","infinity"]
+          image: zhangchl007/shared_memory_example:v25
+          volumeMounts:
+            - name: persistent-storage
+              mountPath: /app/html
+          resources:
+            limits:
+              memory: "512Mi"  # Configure as per application needs
+              cpu: "500m"
+      volumes:
+        - name: persistent-storage
+          persistentVolumeClaim:
+            claimName: blobfuse-pvc
+      nodeSelector:
+        "agentpool": "azlinuxnode1"
