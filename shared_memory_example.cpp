@@ -1,87 +1,109 @@
 #include <boost/interprocess/file_mapping.hpp>
 #include <boost/interprocess/mapped_region.hpp>
-#include <boost/interprocess/permissions.hpp>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
 #include <iostream>
-#include <vector>
-#include <cstring>
-#include <cerrno>
+#include <fstream>
 #include <thread>
 #include <chrono>
+#include <vector>
+#include <cstring>
+#include <cstdlib>
+#include <string>
+#include <ctime>
 
-const size_t kBlockSize = 4096;  // Filesystem block size
+// Namespace alias for convenience
+namespace bip = boost::interprocess;
 
-bool EnsureFileSize(const std::string& file, size_t size) {
-    int fd = open(file.c_str(), O_RDWR | O_CREAT, 0644);  // Removed O_DIRECT
-    if (fd == -1) {
-        std::cerr << "Failed to open file: " << file << " Error: " << strerror(errno) << std::endl;
-        return false;
+// Constants
+const size_t FILE_SIZE = 2L * 1024 * 1024 * 1024; // 2GB
+const std::string FILE_PATH = "/mnt/blobfuse/test_file.dat";
+
+// Function to create and initialize the 2GB file
+void create_large_file() {
+    std::ofstream file(FILE_PATH, std::ios::binary);
+    if (!file) {
+        std::cerr << "Error: Could not create the file." << std::endl;
+        return;
     }
 
-    // Ensure the file size is a multiple of the block size
-    size = ((size + kBlockSize - 1) / kBlockSize) * kBlockSize;
-
-    int res = posix_fallocate(fd, 0, size);
-    close(fd);
-
-    if (res != 0) {
-        std::cerr << "Failed to allocate space for file: " << file << " Error: " << strerror(res) << std::endl;
-        return false;
+    // Write a large file with null bytes
+    std::vector<char> buffer(1024 * 1024, 0); // 1MB buffer
+    for (size_t i = 0; i < FILE_SIZE / buffer.size(); ++i) {
+        file.write(buffer.data(), buffer.size());
     }
 
-    return true;
+    file.close();
+    std::cout << "File created successfully." << std::endl;
 }
 
-void UseDirectIO(const std::string& file) {
-    // Ensure the file size is a multiple of the block size
-    size_t file_size = 65536;  // Example size
-    if (!EnsureFileSize(file, file_size)) {
-        return;
-    }
+// Function to get the current timestamp as a string
+std::string get_current_timestamp() {
+    auto now = std::chrono::system_clock::now();
+    std::time_t now_c = std::chrono::system_clock::to_time_t(now);
+    return std::string(std::ctime(&now_c));
+}
 
-    std::cout << "File size: " << file_size << std::endl;
-
-    // Open the file without O_DIRECT
-    int fd = open(file.c_str(), O_RDWR);
-    if (fd == -1) {
-        std::cerr << "Failed to open file: " << file << " Error: " << strerror(errno) << std::endl;
-        return;
-    }
-
-    boost::interprocess::mapped_region region;
+// Function to write data to the mapped region and sync periodically
+void write_to_mapped_region() {
     try {
-        // Create a file mapping
-        boost::interprocess::file_mapping file_mapping(file.c_str(), boost::interprocess::read_write);
+        bip::file_mapping fmap(FILE_PATH.c_str(), bip::read_write);
+        bip::mapped_region region(fmap, bip::read_write);
 
-        // Map the file into memory
-        region = boost::interprocess::mapped_region(file_mapping, boost::interprocess::read_write);
+        char* mem = static_cast<char*>(region.get_address());
+        size_t offset = 0;
 
-        // Use the mapped region
-        char* addr = static_cast<char*>(region.get_address());
-        std::memset(addr, 0, region.get_size());
+        while (true) {
+            std::string timestamp = get_current_timestamp();
+            std::string data = timestamp + ": New data added to the file.\n";
+            
+            if (offset + data.size() > region.get_size()) {
+                offset = 0; // Wrap around if out of bounds
+            }
 
-        // Example: Write data to the mapped region
-        std::strcpy(addr, "Hello, Boost Interprocess!");
+            std::memcpy(mem + offset, data.c_str(), data.size());
+            offset += data.size();
 
-    } catch (const std::exception& ex) {
-        std::cerr << "Exception::interprocess_exception: " << ex.what() << std::endl;
+            region.flush(); // Sync the mapped region to the file
+            std::cout << "Data written and synced: " << data << std::endl;
+
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
     }
-
-    // Loop to sync the region to the file periodically
-    while (true) {
-        region.flush();
-        std::cout << "Region synced to file." << std::endl;
-        std::this_thread::sleep_for(std::chrono::seconds(5));  // Sync every 5 seconds
-    }
-
-    // Close the file descriptor
-    close(fd);
 }
 
-int main() {
-    std::string file = "/app/html/direct_io_example";
-    UseDirectIO(file);
-    return 0;
+// Function to simulate shared memory reading
+void read_shared_memory() {
+    try {
+        bip::file_mapping fmap(FILE_PATH.c_str(), bip::read_only);
+        bip::mapped_region region(fmap, bip::read_only);
+
+        char* mem = static_cast<char*>(region.get_address());
+
+        while (true) {
+            std::cout << "Reading shared memory data: " << std::string(mem, 100) << std::endl;
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+    }
+}
+
+int main(int argc, char* argv[]) {
+    std::string mode;
+    if (argc > 1) {
+        mode = argv[1];
+    }
+
+    if (mode == "writer") {
+        create_large_file();
+        write_to_mapped_region();
+    } else if (mode == "reader") {
+        read_shared_memory();
+    } else {
+        std::cerr << "Error: Specify mode as either 'writer' or 'reader'." << std::endl;
+        return EXIT_FAILURE;
+    }
+
+    return EXIT_SUCCESS;
 }

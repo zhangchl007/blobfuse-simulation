@@ -1,0 +1,22 @@
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: azureblob-fuse3-me
+provisioner: blob.csi.azure.com
+parameters:
+  skuName: Premium_LRS  # available values: Standard_LRS, Premium_LRS, Standard_GRS, Standard_RAGRS, Standard_ZRS, Premium_ZRS
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+allowVolumeExpansion: true
+mountOptions:
+  - -o allow_other
+  - --file-cache-timeout-in-seconds=5
+  - --use-attr-cache=false
+  - --cancel-list-on-mount-seconds=1
+  - --disable-writeback-cache=true
+  - -o attr_timeout=5
+  - -o entry_timeout=5
+  - -o negative_timeout=5
+  - --log-level=LOG_WARNING
+  - --cache-size-mb=100000

@@ -1,0 +1,80 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shared-memory-example-writer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: shared-memory-example-writer
+  template:
+    metadata:
+      labels:
+        app: shared-memory-example-writer
+    spec:
+      containers:
+        - name: shared-memory-example-writer
+          image: zhangchl007/shared_memory_example_writer:v5
+          volumeMounts:
+            - name: persistent-storage
+              mountPath: /mnt/blobfuse
+          resources:
+            limits:
+              memory: "512Mi"  # Configure as per application needs
+              cpu: "500m"
+      volumes:
+        - name: persistent-storage
+          persistentVolumeClaim:
+            claimName: blobfuse-pvc-me
+      tolerations:
+      - key: "kubernetes.azure.com/scalesetpriority"
+        operator: "Equal"
+        value: "spot"
+        effect: "NoSchedule"
+      - key: "sku"
+        operator: "Equal"
+        value: "paas"
+        effect: "NoSchedule"
+      nodeSelector:
+        "agentpool": "ondemandpool"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shared-memory-example-reader
+spec:
+  replicas: 10
+  selector:
+    matchLabels:
+      app: shared-memory-example-reader
+  template:
+    metadata:
+      labels:
+        app: shared-memory-example-reader
+    spec:
+      containers:
+        - name: shared-memory-example-reader
+          image: zhangchl007/shared_memory_example_writer:v5
+          volumeMounts:
+            - name: persistent-storage
+              mountPath: /mnt/blobfuse
+          resources:
+            limits:
+              memory: "512Mi"  # Configure as per application needs
+              cpu: "500m"
+      volumes:
+        - name: persistent-storage
+          persistentVolumeClaim:
+            claimName: blobfuse-pvc-me
+      tolerations:
+      - key: "kubernetes.azure.com/scalesetpriority"
+        operator: "Equal"
+        value: "spot"
+        effect: "NoSchedule"
+      - key: "sku"
+        operator: "Equal"
+        value: "paas"
+        effect: "NoSchedule"
+      nodeSelector:
+        "agentpool": "ondemandpool"

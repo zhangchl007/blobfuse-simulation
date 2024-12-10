@@ -18,7 +18,7 @@ spec:
           image: zhangchl007/shared_memory_example:v25
           volumeMounts:
             - name: persistent-storage
-              mountPath: /app/html
+              mountPath: /mnt/blobfuse
           resources:
             limits:
               memory: "512Mi"  # Configure as per application needs
