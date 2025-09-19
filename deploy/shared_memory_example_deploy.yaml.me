@@ -15,7 +15,7 @@ spec:
     spec:
       containers:
         - name: shared-memory-example-writer
-          image: zhangchl007/shared_memory_example_writer:v5
+          image: zhangchl007/shared_memory_example_writer:v1.0
           volumeMounts:
             - name: persistent-storage
               mountPath: /mnt/blobfuse
@@ -37,14 +37,14 @@ spec:
         value: "paas"
         effect: "NoSchedule"
       nodeSelector:
-        "agentpool": "ondemandpool"
+        "kubernetes.io/os": "linux"
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: shared-memory-example-reader
 spec:
-  replicas: 10
+  replicas: 5
   selector:
     matchLabels:
       app: shared-memory-example-reader
@@ -55,7 +55,16 @@ spec:
     spec:
       containers:
         - name: shared-memory-example-reader
-          image: zhangchl007/shared_memory_example_writer:v5
+          image: zhangchl007/shared_memory_example_reader:v1.1
+          command: ["/app/shared_memory_example"] 
+          args: ["watch"]   # now manifest optional
+          env:
+            - name: MODEL_BASE
+              value: /mnt/blobfuse/frozen_kv
+            - name: WATCH_INTERVAL_SEC
+              value: "5"
+            - name: TERM
+              value: xterm
           volumeMounts:
             - name: persistent-storage
               mountPath: /mnt/blobfuse
@@ -77,4 +86,4 @@ spec:
         value: "paas"
         effect: "NoSchedule"
       nodeSelector:
-        "agentpool": "ondemandpool"
+        "kubernetes.io/os": "linux"

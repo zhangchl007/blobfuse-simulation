@@ -16,20 +16,149 @@
 #include <vector>
 #include <string>
 #include <thread>
-#include <chrono>
-#include <iostream>
 #include <atomic>
 #include <mutex>
 #include <cerrno>
-#include <cstdint>  // Include for uint64_t
-#include <memory>  // Add for std::align
+#include <cstdint>
+#include <memory>
+#include <sstream>
+#include <cstring>
 
-using namespace std::chrono;  // Add this after the includes
+// Using namespace for chrono
+using namespace std::chrono;
+
+// === Added logging macros and utility ===
+#ifndef LOGGING_MACROS_ADDED
+#define LOGGING_MACROS_ADDED
+#define LOG_ERROR  std::cerr << "[ERROR] "
+#define LOG_INFO   std::cout << "[INFO] "
+#define SPD_LOG_INFO(fmt, ...)  do { std::cout << "[INFO] " << fmt << FormatArgs(__VA_ARGS__) << std::endl; } while(0)
+
+inline std::string FormatArgs() { return ""; }
+template<typename T, typename... R>
+std::string FormatArgs(T&& v, R&&... rest) {
+    std::ostringstream oss;
+    oss << " " << v << FormatArgs(std::forward<R>(rest)...);
+    return oss.str();
+}
+#endif
+
+// === Page touching helper (pre-fault pages) ===
+static void TouchPages(const char* base, std::size_t bytes) {
+    static const std::size_t kPage = 4096;
+    for (std::size_t off = 0; off < bytes; off += kPage) {
+        volatile char c = base[off];
+        (void)c;
+    }
+}
+
+// === Structures for FrozenHashMapImpl (separate from ItemFeatureHandlerV2) ===
+struct FrozenHeader {
+    char     magic[8];       // expect "STRATEGY"
+    uint32_t version;
+    uint32_t model_cnt;
+    uint32_t bucket_cnt;
+    uint32_t entry_cnt;
+    uint32_t val_pool_sz;
+};
+
+struct Model {
+    uint32_t model_id;
+    uint32_t version;
+};
+
+struct Entry {
+    uint32_t key_hash;
+    uint32_t value_offset;
+    uint32_t value_size;
+};
+
+class FrozenHashMapImpl {
+public:
+    bool Build(const std::string& file);
+
+private:
+    std::string file_path_;
+    std::unique_ptr<boost::interprocess::file_mapping> fmap_;
+    std::unique_ptr<boost::interprocess::mapped_region> region_;
+
+    const char*         base_    = nullptr;
+    const FrozenHeader* hdr_     = nullptr;
+    const Model*        models_  = nullptr;
+    const uint32_t*     bucket_  = nullptr;
+    const Entry*        entries_ = nullptr;
+    const char*         val_pool_= nullptr;
+
+    uint32_t mask_ = 0;
+    uint32_t size_ = 0;
+};
+
+bool FrozenHashMapImpl::Build(const std::string& file) {
+    auto begin = std::chrono::system_clock::now();
+    file_path_ = file;
+
+    try {
+        fmap_   = std::make_unique<boost::interprocess::file_mapping>(file.c_str(), boost::interprocess::read_only);
+        region_ = std::make_unique<boost::interprocess::mapped_region>(*fmap_, boost::interprocess::read_only);
+    } catch (const std::exception& ex) {
+        LOG_ERROR << "mmap file failed: " << file << ", error: " << ex.what() << std::endl;
+        return false;
+    }
+
+    base_ = static_cast<const char*>(region_->get_address());
+    if (region_->get_size() < sizeof(FrozenHeader)) {
+        LOG_ERROR << "file too small for header: " << file << std::endl;
+        return false;
+    }
+
+    hdr_ = reinterpret_cast<const FrozenHeader*>(base_);
+    if (std::strncmp(hdr_->magic, "STRATEGY", 8) != 0 || hdr_->version != 1) {
+        LOG_ERROR << "bad header in file: " << file << ", magic: "
+                  << std::string(hdr_->magic, 8) << ", version: " << hdr_->version << std::endl;
+        return false;
+    }
+
+    std::size_t offset = sizeof(FrozenHeader);
+    models_ = reinterpret_cast<const Model*>(base_ + offset);
+    offset += sizeof(Model) * hdr_->model_cnt;
+
+    bucket_ = reinterpret_cast<const uint32_t*>(base_ + offset);
+    offset += sizeof(uint32_t) * hdr_->bucket_cnt;
+
+    entries_ = reinterpret_cast<const Entry*>(base_ + offset);
+    offset += sizeof(Entry) * hdr_->entry_cnt;
+
+    val_pool_ = reinterpret_cast<const char*>(base_ + offset);
+    mask_ = hdr_->bucket_cnt ? (hdr_->bucket_cnt - 1) : 0;
+    size_ = hdr_->entry_cnt;
+
+    madvise(const_cast<char*>(base_), region_->get_size(), MADV_WILLNEED);
+    TouchPages(base_, region_->get_size());
+
+    std::stringstream ss;
+    ss << "load model:";
+    for (uint32_t i = 0; i < hdr_->model_cnt; ++i) {
+        auto m = models_[i];
+        if (m.model_id == 0 || m.version == 0) {
+            LOG_ERROR << "bad model in file: " << file << ", model_id: " << m.model_id
+                      << ", version: " << m.version << std::endl;
+            return false;
+        }
+        ss << " <" << m.model_id << ":" << m.version << ">";
+    }
+
+    auto cost = std::chrono::duration<double>(std::chrono::system_clock::now() - begin).count();
+    SPD_LOG_INFO(" {} success", ss.str());
+    SPD_LOG_INFO(" kv file: {}, entry count: {}, bucket count: {}, value pool size: {}, successfully !, cost: {:.2f}s",
+                 file, hdr_->entry_cnt, hdr_->bucket_cnt, hdr_->val_pool_sz, cost);
+
+    return true;
+}
 
 const char* kMmfItemFeatureMapName = "ItemFeatureMap";
 const char* kMmfItemFeatureVecName = "ItemFeatureVec";
-const uint64_t kMinimumFileSize = 4096ULL * 1000ULL;  // Use uint64_t to avoid overflow
-const size_t kBlockSize = 4096;  // Filesystem block size
+const uint64_t kMinimumFileSize = 4096ULL * 1000ULL;
+const size_t kBlockSize = 4096;
 
 class ItemFeatureHandlerV2 {
 public:
@@ -37,38 +166,41 @@ public:
     void Reserve(size_t size);
     void Set(const std::string& key, std::pair<const char*, size_t> value);
     void StartContinuousUpdate(const std::string& file, int update_interval_ms);
-    bool WriteToSharedMemory(const std::string& shared_memory_file);
+    bool WriteToSharedMemory(const std::string& shared_memory_file); // public (locks)
     bool ReadFromSharedMemory(const std::string& shared_memory_file);
 
 public:
     std::atomic<bool> running_{true};
 
 private:
-    struct alignas(4096) Header {  // Align to 4KB boundary
+    struct alignas(4096) Header {
         size_t map_size;
         size_t vec_size;
-        char padding[4080];  // Pad to 4KB
+        char   padding[4080];
     };
 
     std::unordered_map<std::string, std::vector<char>> data_map_;
     std::vector<std::pair<std::string, std::vector<char>>> data_vec_;
-    std::mutex data_mutex_;  // Mutex for thread-safe access
+    std::mutex data_mutex_;
 
     bool DependencyCheck(const std::string& file, std::string* updating_file);
-    size_t CalculateRequiredSize();
+    size_t SerializeSizeUnlocked() const;
+    size_t CalculateRequiredSize(); // wrapper
     bool EnsureFileSize(const std::string& file, size_t size);
+    bool WriteToSharedMemoryUnlocked(const std::string& shared_memory_file); // core without locking
 };
 
 bool ItemFeatureHandlerV2::DependencyCheck(const std::string& file, std::string* updating_file) {
+    (void)updating_file;
     std::cout << "Dependency check for " << file << std::endl;
-    return true;  // Simulated success
+    return true;
 }
 
 void ItemFeatureHandlerV2::Reserve(size_t size) {
     std::lock_guard<std::mutex> lock(data_mutex_);
     data_map_.reserve(size);
     data_vec_.reserve(size);
-    std::cout << "Reserved space for " << size << " elements in data_map_ and data_vec_." << std::endl;
+    std::cout << "Reserved space for " << size << " elements." << std::endl;
 }
 
 void ItemFeatureHandlerV2::Set(const std::string& key, std::pair<const char*, size_t> value) {
@@ -76,60 +208,131 @@ void ItemFeatureHandlerV2::Set(const std::string& key, std::pair<const char*, si
     std::vector<char> data(value.first, value.first + value.second);
     data_map_[key] = data;
     data_vec_.emplace_back(key, data);
-    std::cout << "Stored data for key: " << key << " with size: " << value.second << std::endl;
+    std::cout << "Stored key: " << key << " size: " << value.second << std::endl;
 }
 
-// Calculate required size for shared memory file based on data size
+// Compute serialized payload size (header + entries aligned to kBlockSize).
+size_t ItemFeatureHandlerV2::SerializeSizeUnlocked() const {
+    size_t total = sizeof(Header);
+    for (const auto& kv : data_map_) {
+        // Layout per entry:
+        // [size_t key_size][key bytes][size_t value_size][value bytes]
+        size_t entry = sizeof(size_t) + kv.first.size()
+                     + sizeof(size_t) + kv.second.size();
+        // Align each entry start to kBlockSize (mirrors writer logic)
+        total = ((total + kBlockSize - 1) / kBlockSize) * kBlockSize;
+        total += entry;
+    }
+    total = ((total + kBlockSize - 1) / kBlockSize) * kBlockSize;
+    if (total < kMinimumFileSize) total = kMinimumFileSize;
+    return total;
+}
+
 size_t ItemFeatureHandlerV2::CalculateRequiredSize() {
     std::lock_guard<std::mutex> lock(data_mutex_);
-
-    size_t size = 0;
-    for (const auto& pair : data_map_) {
-        size += sizeof(pair.first) + pair.first.size() + sizeof(pair.second) + pair.second.size();
-    }
-    for (const auto& pair : data_vec_) {
-        size += sizeof(pair.first) + pair.first.size() + sizeof(pair.second) + pair.second.size();
-    }
-
-    // Ensure minimum file size to avoid small allocations
-    return std::max(size, kMinimumFileSize);
+    return SerializeSizeUnlocked();
 }
 
-// Ensure file is at least the specified size
 bool ItemFeatureHandlerV2::EnsureFileSize(const std::string& file, size_t size) {
-    // Round up size to 4KB alignment
     size = (size + 4095) & ~4095ULL;
-    
-    int fd = open(file.c_str(), O_RDWR | O_CREAT | O_DIRECT, 0644);  // Add O_DIRECT flag
+    int fd = open(file.c_str(), O_RDWR | O_CREAT, 0644);
     if (fd == -1) {
         std::cerr << "Failed to open file: " << file << " Error: " << strerror(errno) << std::endl;
         return false;
     }
-
     int res = posix_fallocate(fd, 0, size);
     close(fd);
-
     if (res != 0) {
-        std::cerr << "Failed to allocate space for file: " << file << " Error: " << strerror(res) << std::endl;
+        std::cerr << "Failed to allocate space for file: " << file
+                  << " Error: " << strerror(res) << std::endl;
         return false;
     }
-
     return true;
+}
+
+bool ItemFeatureHandlerV2::WriteToSharedMemory(const std::string& shared_memory_file) {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    return WriteToSharedMemoryUnlocked(shared_memory_file);
+}
+
+bool ItemFeatureHandlerV2::WriteToSharedMemoryUnlocked(const std::string& shared_memory_file) {
+    try {
+        size_t required_size = SerializeSizeUnlocked();
+
+        if (!EnsureFileSize(shared_memory_file, required_size)) {
+            std::cerr << "EnsureFileSize failed" << std::endl;
+            return false;
+        }
+
+        boost::interprocess::file_mapping file_mapping(
+            shared_memory_file.c_str(),
+            boost::interprocess::read_write
+        );
+        boost::interprocess::mapped_region region(
+            file_mapping,
+            boost::interprocess::read_write
+        );
+        if (region.get_size() < required_size) {
+            std::cerr << "Region smaller than required_size" << std::endl;
+            return false;
+        }
+
+        char* addr = static_cast<char*>(region.get_address());
+        std::memset(addr, 0, required_size);
+
+        Header header{};
+        header.map_size = data_map_.size();
+        header.vec_size = data_vec_.size();
+        std::memcpy(addr, &header, sizeof(Header));
+
+        size_t offset = sizeof(Header);
+        for (const auto& kv : data_map_) {
+            offset = ((offset + kBlockSize - 1) / kBlockSize) * kBlockSize;
+            char* current = addr + offset;
+
+            size_t key_size = kv.first.size();
+            std::memcpy(current, &key_size, sizeof(size_t));
+            current += sizeof(size_t);
+            offset += sizeof(size_t);
+
+            std::memcpy(current, kv.first.data(), key_size);
+            current += key_size;
+            offset += key_size;
+
+            size_t value_size = kv.second.size();
+            std::memcpy(current, &value_size, sizeof(size_t));
+            current += sizeof(size_t);
+            offset += sizeof(size_t);
+
+            std::memcpy(current, kv.second.data(), value_size);
+            offset += value_size;
+        }
+
+        region.flush();
+        madvise(addr, required_size, MADV_WILLNEED);
+        TouchPages(addr, required_size);
+
+        std::cout << "Written file: " << shared_memory_file
+                  << " map_entries=" << header.map_size
+                  << " vec_entries=" << header.vec_size
+                  << " bytes=" << required_size << std::endl;
+        return true;
+    } catch (const std::exception& ex) {
+        std::cerr << "WriteToSharedMemory exception: " << ex.what() << std::endl;
+        return false;
+    }
 }
 
 bool ItemFeatureHandlerV2::Update(const std::string& file) {
     std::string updating_file(file);
-
     if (!DependencyCheck(file, &updating_file)) {
-        std::cerr << "Dependency check failed, stop updating file " << file << std::endl;
+        std::cerr << "Dependency check failed for " << file << std::endl;
         return false;
     }
 
-    std::cout << "Begin to update file: " << updating_file << std::endl;
-
+    std::cout << "Begin update: " << updating_file << std::endl;
     auto start_time = system_clock::now();
 
-    // Check if file exists and create if necessary
     if (access(updating_file.c_str(), F_OK) == -1) {
         int fd = open(updating_file.c_str(), O_CREAT | O_RDWR, 0644);
         if (fd == -1) {
@@ -140,200 +343,77 @@ bool ItemFeatureHandlerV2::Update(const std::string& file) {
         std::cout << "File created: " << updating_file << std::endl;
     }
 
-    // Set file permissions
     if (chmod(updating_file.c_str(), 0644) == -1) {
-        std::cerr << "Failed to set file permissions: " << updating_file << std::endl;
+        std::cerr << "chmod failed: " << updating_file << std::endl;
         return false;
     }
 
     try {
-        // Lock the data while we're working with it
         std::lock_guard<std::mutex> lock(data_mutex_);
-
-        std::cout << "Current data sizes - Map: " << data_map_.size() 
-                  << ", Vec: " << data_vec_.size() << std::endl;
-
-        // Calculate required size
-        size_t required_size = CalculateRequiredSize();
-        
-        if (!EnsureFileSize(updating_file, required_size)) {
-            std::cerr << "Failed to ensure file size" << std::endl;
-            return false;
-        }
-
-        // Write directly to the file
-        if (!WriteToSharedMemory(updating_file)) {
-            std::cerr << "Failed to write to shared memory file" << std::endl;
-            return false;
-        }
+        size_t required_size = SerializeSizeUnlocked();
+        if (!EnsureFileSize(updating_file, required_size)) return false;
+        if (!WriteToSharedMemoryUnlocked(updating_file)) return false;
 
         auto load_duration = std::chrono::duration<double>(system_clock::now() - start_time).count();
-        std::cout << "File update completed in " << load_duration << " seconds" << std::endl;
-
+        std::cout << "Update completed in " << load_duration << " seconds" << std::endl;
         return true;
-    }
-    catch (const std::exception& ex) {
-        std::cerr << "Exception in Update: " << ex.what() << std::endl;
+    } catch (const std::exception& ex) {
+        std::cerr << "Update exception: " << ex.what() << std::endl;
         return false;
     }
 }
 
-bool ItemFeatureHandlerV2::WriteToSharedMemory(const std::string& shared_memory_file) {
-    std::lock_guard<std::mutex> lock(data_mutex_);
-
-    try {
-        std::cout << "Writing to shared memory file: " << shared_memory_file << std::endl;
-        std::cout << "Current data sizes - Map: " << data_map_.size() 
-                  << ", Vec: " << data_vec_.size() << std::endl;
-
-        // Calculate total size needed
-        size_t required_size = sizeof(Header);
-        for (const auto& pair : data_map_) {
-            required_size += sizeof(size_t) * 2;
-            required_size += pair.first.size();
-            required_size += pair.second.size();
-        }
-        
-        // Round up to block size
-        required_size = ((required_size + kBlockSize - 1) / kBlockSize) * kBlockSize;
-        required_size = std::max(required_size, kMinimumFileSize);
-
-        // Step 1: Create and allocate the file with O_DIRECT
-        int fd = open(shared_memory_file.c_str(), O_RDWR | O_CREAT | O_DIRECT, 0644);
-        if (fd == -1) {
-            std::cerr << "Failed to open file with O_DIRECT: " << strerror(errno) << std::endl;
-            return false;
-        }
-
-        // Allocate space
-        int res = posix_fallocate(fd, 0, required_size);
-        close(fd);
-        if (res != 0) {
-            std::cerr << "Failed to allocate space: " << strerror(res) << std::endl;
-            return false;
-        }
-
-        // Step 2: Create file mapping without O_DIRECT
-        boost::interprocess::file_mapping file_mapping(
-            shared_memory_file.c_str(),
-            boost::interprocess::read_write
-        );
-
-        // Map the region
-        boost::interprocess::mapped_region region(
-            file_mapping,
-            boost::interprocess::read_write
-        );
-
-        // Get the address
-        char* addr = static_cast<char*>(region.get_address());
-        
-        // Clear the memory
-        std::memset(addr, 0, region.get_size());
-
-        // Write header
-        Header header{data_map_.size(), data_vec_.size()};
-        std::memcpy(addr, &header, sizeof(Header));
-        size_t offset = sizeof(Header);
-
-        // Write map data
-        for (const auto& pair : data_map_) {
-            // Align to block boundary
-            offset = ((offset + kBlockSize - 1) / kBlockSize) * kBlockSize;
-            char* current_pos = addr + offset;
-
-            // Write key size
-            size_t key_size = pair.first.size();
-            std::memcpy(current_pos, &key_size, sizeof(size_t));
-            current_pos += sizeof(size_t);
-            offset += sizeof(size_t);
-
-            // Write key
-            std::memcpy(current_pos, pair.first.c_str(), key_size);
-            current_pos += key_size;
-            offset += key_size;
-
-            // Write value size
-            size_t value_size = pair.second.size();
-            std::memcpy(current_pos, &value_size, sizeof(size_t));
-            current_pos += sizeof(size_t);
-            offset += sizeof(size_t);
-
-            // Write value
-            std::memcpy(current_pos, pair.second.data(), value_size);
-            offset += value_size;
-        }
-
-        // Ensure data is written to disk
-        region.flush();
-
-        std::cout << "Successfully written to shared memory file: " << shared_memory_file << "\n"
-                  << "Total size: " << required_size << " bytes\n"
-                  << "Map entries: " << header.map_size << "\n"
-                  << "Vec entries: " << header.vec_size << std::endl;
-
-        return true;
-    }
-    catch (const std::exception& ex) {
-        std::cerr << "Exception in WriteToSharedMemory: " << ex.what() << std::endl;
-        return false;
-    }
-}
-
-// Add this method to verify the data was written correctly
 bool ItemFeatureHandlerV2::ReadFromSharedMemory(const std::string& shared_memory_file) {
     try {
-        // Create file mapping
         boost::interprocess::file_mapping file(
-            shared_memory_file.c_str(), 
+            shared_memory_file.c_str(),
             boost::interprocess::read_only
         );
-
-        // Map the region
         boost::interprocess::mapped_region region(
-            file, 
+            file,
             boost::interprocess::read_only
         );
-
         const char* mapped_data = static_cast<const char*>(region.get_address());
 
-        // Read header
+        madvise(const_cast<char*>(mapped_data), region.get_size(), MADV_WILLNEED);
+        TouchPages(mapped_data, region.get_size());
+
+        if (region.get_size() < sizeof(Header)) {
+            std::cerr << "Region too small" << std::endl;
+            return false;
+        }
+
         const Header* header = reinterpret_cast<const Header*>(mapped_data);
         size_t offset = sizeof(Header);
 
-        std::cout << "Reading from shared memory file:\n"
+        std::cout << "Reading shared memory file:\n"
                   << "Map entries: " << header->map_size << "\n"
                   << "Vec entries: " << header->vec_size << std::endl;
 
-        // Read map entries
         for (size_t i = 0; i < header->map_size; ++i) {
-            // Align offset to 512 bytes
-            offset = ((offset + 511) / 512) * 512;
+            offset = ((offset + kBlockSize - 1) / kBlockSize) * kBlockSize;
 
-            // Read key size
+            if (offset + sizeof(size_t) > region.get_size()) break;
             size_t key_size;
             std::memcpy(&key_size, mapped_data + offset, sizeof(size_t));
             offset += sizeof(size_t);
+            if (offset + key_size + sizeof(size_t) > region.get_size()) break;
 
-            // Read key
             std::string key(mapped_data + offset, key_size);
             offset += key_size;
 
-            // Read value size
             size_t value_size;
             std::memcpy(&value_size, mapped_data + offset, sizeof(size_t));
             offset += sizeof(size_t);
+            if (offset + value_size > region.get_size()) break;
 
-            // Skip value data but print info
-            std::cout << "Entry " << i << ": Key=" << key 
-                     << ", Value size=" << value_size << " bytes" << std::endl;
+            std::cout << "Entry " << i << ": Key=" << key
+                      << ", Value size=" << value_size << " bytes" << std::endl;
             offset += value_size;
         }
-
         return true;
-    }
-    catch (const std::exception& ex) {
-        std::cerr << "Exception in ReadFromSharedMemory: " << ex.what() << std::endl;
+    } catch (const std::exception& ex) {
+        std::cerr << "ReadFromSharedMemory exception: " << ex.what() << std::endl;
         return false;
     }
 }
@@ -341,28 +421,22 @@ bool ItemFeatureHandlerV2::ReadFromSharedMemory(const std::string& shared_memory
 void ItemFeatureHandlerV2::StartContinuousUpdate(const std::string& file, int update_interval_ms) {
     while (running_) {
         if (!Update(file)) {
-            std::cerr << "Update failed, stopping continuous updates." << std::endl;
+            std::cerr << "Update failed, stopping." << std::endl;
             break;
         }
-
         std::this_thread::sleep_for(std::chrono::milliseconds(update_interval_ms));
     }
 }
 
 int main() {
     ItemFeatureHandlerV2 handler;
-
-    // Add test data
     std::string test_value1 = "test_value_data_1";
     std::string test_value2 = "test_value_data_2";
-    
-    std::cout << "\n=== Adding test data ===" << std::endl;
     handler.Set("test_key_1", {test_value1.c_str(), test_value1.size()});
     handler.Set("test_key_2", {test_value2.c_str(), test_value2.size()});
 
     const std::string shared_memory_path = "/app/html/file_backed_shared_memory";
 
-    std::cout << "\n=== Initial write to shared memory ===" << std::endl;
     if (!handler.WriteToSharedMemory(shared_memory_path)) {
         std::cerr << "Initial write failed!" << std::endl;
         return 1;
@@ -374,21 +448,16 @@ int main() {
         return 1;
     }
 
-    std::cout << "\n=== Starting continuous update ===" << std::endl;
+    FrozenHashMapImpl frozen_loader;
+    // frozen_loader.Build("/app/html/frozen_kv_file");
+
     std::thread updater([&handler, &shared_memory_path]() {
         handler.StartContinuousUpdate(shared_memory_path, 5000);
     });
 
-    // Wait for a few updates
     std::this_thread::sleep_for(std::chrono::seconds(2));
-
-    std::cout << "\n=== Verifying after updates ===" << std::endl;
     handler.ReadFromSharedMemory(shared_memory_path);
-
-    // Clean up
-    std::cout << "\n=== Cleaning up ===" << std::endl;
     handler.running_ = false;
     updater.join();
-
     return 0;
 }

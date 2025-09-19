@@ -36,4 +36,4 @@ RUN chown -R appuser:appuser /app
 USER appuser
 
 # Entry point for the container
-CMD ["./shared_memory_example", "writer"]
+CMD ["./shared_memory_example"]

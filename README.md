@@ -75,6 +75,14 @@ To run the application in reader mode:
 
 ```sh
 docker run --rm -it shared_memory_example_reader
+
+apt-get update && \
+apt-get install -y g++ make libboost-all-dev libssl-dev cmake
+ 
+# build C++ code
+ 
+g++ -o shared_memory_example shared_memory_example.cpp -lboost_system -lrt -lpthread
+ 
 ```
 
 ## License
@@ -82,8 +90,5 @@ docker run --rm -it shared_memory_example_reader
 This project is licensed under the MIT License.
 ```
 
-This 
-
-README.md
-
+This README.md
  provides an overview of the project, instructions for building and pushing Docker images, and details on Kubernetes deployment.
